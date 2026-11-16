@@ -1,5 +1,7 @@
 # Wayback Site Archiver
 
+[![CI](https://github.com/cspenn/wayback-site-archiver/actions/workflows/ci.yml/badge.svg)](https://github.com/cspenn/wayback-site-archiver/actions/workflows/ci.yml)
+
 This tool crawls a website. It asks the [Wayback Machine](https://web.archive.org) to save each page that has no recent snapshot.
 
 The Wayback Machine cannot reach all pages. It misses deep pages, pages that change fast, and pages that block its crawler. This tool finds those pages and submits them. If our crawler cannot read a page, the tool still submits the page. The Wayback Machine then reads it from its own servers.
@@ -56,6 +58,8 @@ You need these items:
 Clone the repository. Go to its folder. Install the dependencies:
 
 ```bash
+git clone https://github.com/cspenn/wayback-site-archiver.git
+cd wayback-site-archiver
 uv sync
 ```
 
