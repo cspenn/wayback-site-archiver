@@ -1,0 +1,40 @@
+# claude-setup: library links — managed block
+.claude/claude-env.state.json
+temp/claude-setup-backups/
+archived/claude-setup-stash/
+
+# Python & project workspace
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+data/
+logs/
+temp/
+.superpowers/
+
+
+.DS_Store
+
+# Local tooling, library links, and working notes. Never published.
+/.claude/
+/.agents/
+/.opencode/
+/AGENTS.md
+/CLAUDE.md
+/recipe.md
+/graphify-out/
+/claude-graphify-semantic.sh
+/docs/installedtools.md
+/docs/orientation.md
+/docs/rules-python.md
+/docs/asd-ste.yaml
+/docs/checklist-human-writing-qa.yaml
+/docs/trust-insights-brand
+/docs/superpowers/plans/
+/references/
+/output/

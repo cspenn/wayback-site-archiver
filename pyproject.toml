@@ -1,0 +1,112 @@
+[project]
+name = "software-civil-service"
+version = "0.1.0"
+description = "Low-resource CLI tool to crawl a website and archive public URLs on the Wayback Machine."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "camoufox>=0.4.11",
+    "curl-cffi>=0.10.0",
+    "orjson>=3.10.15",
+    "pydantic>=2.10.6",
+    "pydantic-settings[yaml]>=2.8.1",
+    "pyyaml>=6.0.2",
+    "rich>=13.9.4",
+    "structlog>=25.1.0",
+    "typer>=0.15.2",
+]
+
+[project.scripts]
+civil-service = "civil_service.main:app"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.8.3",
+    "deptry>=0.23.0",
+    "mypy>=1.15.0",
+    "pip-audit>=2.9.0",
+    "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.11.0",
+    "types-PyYAML>=6.0.12.20241230",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/civil_service"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+filterwarnings = ["error::DeprecationWarning:civil_service.*"]
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["src/civil_service"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["camoufox", "camoufox.*", "curl_cffi", "curl_cffi.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E5",
+    "E7",
+    "E9",
+    "W",
+    "F",
+    "B",
+    "I",
+    "UP",
+    "TRY",
+    "SIM",
+    "PIE",
+    "ARG",
+    "C901",
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    "S",
+    "TC",
+    "D",
+    "RET",
+    "ERA",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 5
+max-returns = 6
+max-branches = 12
+max-statements = 50
+
+[tool.deptry]
+extend_exclude = ["tests"]
