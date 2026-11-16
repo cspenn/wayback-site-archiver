@@ -753,3 +753,60 @@ def test_curl_cffi_does_not_pin_ip_literals(monkeypatch: pytest.MonkeyPatch) -> 
         impersonate="chrome",
     )
     assert FakeSession.init_kwargs["curl_options"] == {}
+
+
+def test_closing_a_browser_that_already_died_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import civil_service.fetcher as fetcher_mod
+
+    class DeadOnClose(FakeCamoufox):
+        def __exit__(self, *_args: object) -> None:
+            raise RuntimeError("driver-connection-closed")
+
+    FakeCamoufox.entered = 0
+    monkeypatch.setattr(fetcher_mod, "Camoufox", DeadOnClose)
+    pool = CamoufoxPool("Wayback Archiving", 10.0)
+    assert pool.fetch(Request(URL, max_bytes=100)).status_code == 200
+    with structlog.testing.capture_logs() as logs:
+        pool.close()  # must not raise
+    assert [e["event"] for e in logs] == ["browser_close_failed"]
+    assert "driver-connection-closed" in logs[0]["error"]
+    # The pool forgot the dead browser, so a later fetch starts a new one.
+    assert pool.fetch(Request(URL, max_bytes=100)).status_code == 200
+    assert FakeCamoufox.entered == 2
+    with structlog.testing.capture_logs():
+        pool.close()
+
+
+def test_a_stop_still_ends_as_an_interrupt_when_the_browser_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's case: Ctrl-C kills the browser helper, then cleanup closes a dead browser."""
+    import civil_service.fetcher as fetcher_mod
+    import civil_service.runner as runner_mod
+
+    class DeadOnClose(FakeCamoufox):
+        def __exit__(self, *_args: object) -> None:
+            raise RuntimeError("driver-connection-closed")
+
+    def interrupted(req: Request) -> FetchResult:
+        if req.url.endswith(("/robots.txt", "/sitemap.xml")):
+            return FetchResult(404, {}, b"", "text/plain")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fetcher_mod, "Camoufox", DeadOnClose)
+    settings = AppSettings(
+        db_path=tmp_path / "close.sqlite3",
+        fallbacks=["curl", "camoufox"],
+        respect_robots_txt=False,
+        max_sitemaps=0,
+        threads=1,
+    )
+    fetcher = TieredFetcher(settings, transports={"curl": interrupted})
+    fetcher._camoufox_pool.fetch(Request(URL, max_bytes=100))  # the browser is running
+    # run_archiver builds and closes its own fetcher, as it does for the command line.
+    monkeypatch.setattr(runner_mod, "TieredFetcher", lambda _settings: fetcher)
+    with structlog.testing.capture_logs() as logs, pytest.raises(KeyboardInterrupt):
+        runner_mod.run_archiver("https://example.com/", settings)
+    assert "browser_close_failed" in [e["event"] for e in logs]

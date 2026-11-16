@@ -386,18 +386,24 @@ class CamoufoxPool:
         return executor.submit(self._fetch_on_thread, req).result()
 
     def _close_on_thread(self) -> None:
-        if self._cm is not None:
-            self._cm.__exit__(None, None, None)
-            self._cm = None
-            self._browser = None
+        cm, self._cm, self._browser = self._cm, None, None
+        if cm is not None:
+            cm.__exit__(None, None, None)
 
     def close(self) -> None:
-        """Close the shared Camoufox browser instance if it was started."""
+        """Close the shared Camoufox browser instance if it was started.
+
+        Cleanup never raises. A terminal Ctrl-C also kills the browser's helper process, and
+        closing a dead browser then fails. That failure must not hide the real exit reason.
+        """
         with self._lock:
             executor = self._executor
             self._executor = None
         if executor is not None:
-            executor.submit(self._close_on_thread).result()
+            try:
+                executor.submit(self._close_on_thread).result()
+            except Exception as exc:  # the browser is already gone
+                _LOGGER.info("browser_close_failed", error=str(exc))
             executor.shutdown(wait=True)
 
 

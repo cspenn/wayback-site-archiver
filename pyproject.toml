@@ -41,6 +41,7 @@ build-backend = "hatchling.build"
 packages = ["src/civil_service"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 pythonpath = ["src"]
 filterwarnings = ["error::DeprecationWarning:civil_service.*"]
 

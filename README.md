@@ -239,6 +239,30 @@ An archive.org account gives higher capture limits. The tool can then confirm ea
 
    If you see `FAILED` rows, read the `error` field in `run.log`. Use `jq -c 'select(.event == "archive_failed")' run.log`. An HTTP 401 or 403 in the message most likely means that a key is wrong. When the test passes, remove the two limits from `config.yml`.
 
+### Run jobs in parallel (optional)
+
+By default the tool runs one job at a time. This is slow for a large site. Your account can run several jobs at the same time. To see how many, run this command:
+
+```bash
+curl -s -H "Accept: application/json" -H "Authorization: LOW $CIVIL_SERVICE_SPN_ACCESS_KEY:$CIVIL_SERVICE_SPN_SECRET_KEY" "https://web.archive.org/save/status/user?_t=$(date +%s)"
+```
+
+The reply looks like this (the numbers are an example):
+
+```json
+{"processing":0,"available":3,"daily_captures":801,"daily_captures_limit":30000,"daily_status":3747,"daily_status_limit":70000}
+```
+
+Set `archive_threads` to the `available` number. Each poll of a job uses one of your daily status calls. The reply shows that limit as `daily_status_limit`. A longer `spn2_poll_seconds` saves status calls. These settings fit an account with 3 sessions:
+
+```yaml
+archive_threads: 3
+spn2_poll_seconds: 8.0
+spn2_max_polls: 15
+```
+
+Put the settings in a file. Pass the file with `--config`. The threads share one 9-second delay, so the rate stays under 7 captures a minute. If the service reports a session limit, the tool retries the URL later.
+
 Set both keys. If one key is empty or missing, the tool uses anonymous mode. The tool does not warn you.
 
 With keys, the tool sends each submission through the SPN2 API. It polls the job and records `ARCHIVED` for a confirmed capture.
