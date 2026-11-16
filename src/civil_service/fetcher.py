@@ -35,7 +35,7 @@ _LOGGER = structlog.get_logger(__name__)
 _MS_PER_SECOND = 1000
 _MIN_STATUS_PARTS = 2
 _PRIVATE_FILE_MODE = 0o600
-_SECRET_ENV_PREFIX = "CIVIL_SERVICE_SPN_"  # noqa: S105
+_HIDDEN_ENV_PREFIX = "CIVIL_SERVICE_SPN_"  # variables that child processes must not see
 _RATE_LIMIT_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.SERVICE_UNAVAILABLE})
 _REDIRECT_STATUSES = frozenset(
     {
@@ -180,7 +180,7 @@ def _curl_command(req: Request, user_agent: str, timeout: float, tmp: Path) -> l
 
 def _child_environment() -> dict[str, str]:
     """Return the process environment without the archive.org API keys, for child processes."""
-    return {k: v for k, v in os.environ.items() if not k.startswith(_SECRET_ENV_PREFIX)}
+    return {k: v for k, v in os.environ.items() if not k.startswith(_HIDDEN_ENV_PREFIX)}
 
 
 def _run_curl(cmd: list[str], max_bytes: int) -> tuple[bytes, bool, int, str]:
