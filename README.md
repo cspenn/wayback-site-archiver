@@ -204,7 +204,7 @@ sqlite3 data/example.com.sqlite3 "SELECT archive_status, COUNT(*) FROM urls GROU
 sqlite3 data/example.com.sqlite3 "SELECT url, crawl_status FROM urls WHERE archive_status = 'FAILED'"
 ```
 
-`crawl_status` holds the HTTP status. It holds `0` if the fetch failed. It holds `-1` if `robots.txt` blocked the crawl.
+`crawl_status` holds the HTTP status. It holds `0` if the fetch failed. It holds `-1` if `robots.txt` blocked the crawl. For a confirmed capture, `snapshot_ts` holds the snapshot time that the job reported, and `snapshot_url` holds the captured URL. Use the Wayback CDX search to look up that snapshot.
 
 An older catalog (without the retry counters) upgrades itself when you first open it.
 
@@ -231,7 +231,11 @@ An archive.org account gives higher capture limits. The tool can then confirm ea
    sqlite3 data/your-site.example.sqlite3 "SELECT archive_status, COUNT(*) FROM urls GROUP BY 1"
    ```
 
-   A good result shows `ARCHIVED` rows and a coverage line with confirmed URLs. The tool polls each job for about one minute (`spn2_max_polls` times `spn2_poll_seconds`). A slower capture stays `SUBMITTED`. The tool does not confirm it.
+   A good result shows `ARCHIVED` rows and a coverage line with confirmed URLs. The tool records `ARCHIVED` only if the job reports a snapshot time. A job that succeeds without a snapshot time stays `SUBMITTED`. The tool polls each job for about one minute (`spn2_max_polls` times `spn2_poll_seconds`). A slower capture stays `SUBMITTED`. The tool does not confirm it.
+
+  
+
+   Each job writes one log line. Read it with `jq -c 'select(.event == "archive_job")' run.log`. The line shows the job status, the snapshot time, and any error.
 
    If you see `FAILED` rows, read the `error` field in `run.log`. Use `jq -c 'select(.event == "archive_failed")' run.log`. An HTTP 401 or 403 in the message most likely means that a key is wrong. When the test passes, remove the two limits from `config.yml`.
 
@@ -275,7 +279,7 @@ The `curl` child process gets no keys in its environment. The headless browser i
 | `Another run uses the catalog` | Another process uses this catalog. Wait until it ends, or stop it. |
 | `Camoufox could not start` | Run `uv run python -m camoufox fetch`. The run continues without the browser. |
 | Many `crawl_retry` or `archive_retry` log events | The site rate limits the tool. Lower `threads`, or wait. The tool waits longer after each rate limit. |
-| Many `archive_failed` events | Read the `error` field in the log lines. If archive.org answers `429`, raise `archive_delay_seconds`. |
+| Many `archive_failed` events | Read the `error` field in the log lines. If archive.org answers `429`, raise `archive_delay_seconds`. A temporary job error (for example `user-session-limit`) retries the URL. Only a final error fails it. |
 | The run seems stuck | A host pause or a long `Retry-After` is active. The progress bar moves again after the wait. |
 
 The logs are JSON lines on standard error. Write them to a file. Filter them with `jq`:

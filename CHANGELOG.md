@@ -17,6 +17,7 @@ First public release.
 - Safe to repeat and to resume: a repeat inside the freshness window fetches nothing and sends nothing. A run that dies without cleanup (`kill -9`, a crash) continues from the saved state and loses no link. A second run on the same catalog stops with an error (not on Windows).
 - A configurable freshness window: a snapshot older than 7 days (default) triggers a new capture.
 - Optional authenticated Save Page Now with archive.org API keys from the environment. The tool then confirms each capture.
+- With API keys, a capture counts as confirmed only when the job reports a snapshot time. The catalog keeps the snapshot time and the captured URL. Each job writes one `archive_job` log event. A temporary job error (a session limit, a timeout) retries the URL.
 - A coverage report at the end of each run, and live progress with counts of done and remaining items.
 - Ctrl-C stops cleanly and exits with code 130. A second Ctrl-C quits at once. The next run resumes.
 - JSON logs on standard error. A `civil-service` command and a `python -m civil_service.main` entry point.

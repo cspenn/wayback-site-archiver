@@ -30,17 +30,25 @@ CREATE TABLE IF NOT EXISTS urls (
     archive_http_status INTEGER,
     archived_at TEXT,
     crawl_attempts INTEGER NOT NULL DEFAULT 0,
-    archive_attempts INTEGER NOT NULL DEFAULT 0
+    archive_attempts INTEGER NOT NULL DEFAULT 0,
+    snapshot_ts TEXT,
+    snapshot_url TEXT
 );
 """
-_ATTEMPT_COLUMNS = ("crawl_attempts", "archive_attempts")
+# Columns that later versions added. An older catalog gets them when it opens.
+_ADDED_COLUMNS = {
+    "crawl_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "archive_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "snapshot_ts": "TEXT",
+    "snapshot_url": "TEXT",
+}
 _CREATE_INDEXES_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_crawl ON urls (needs_crawl, crawl_attempts)",
     "CREATE INDEX IF NOT EXISTS idx_archive ON urls (archive_status, archive_attempts)",
 )
 _COLUMNS = (
     "url, is_internal, needs_crawl, crawl_status, crawled_at, archive_status, "
-    "archive_http_status, archived_at, crawl_attempts, archive_attempts"
+    "archive_http_status, archived_at, crawl_attempts, archive_attempts, snapshot_ts, snapshot_url"
 )
 # An internal URL waits for its crawl so the catalog knows whether the page is gone (404/410).
 _ARCHIVE_ELIGIBLE = "(is_internal = 0 OR (needs_crawl = 0 AND crawl_status NOT IN (404, 410)))"
@@ -97,6 +105,16 @@ class CatalogEntry:
     archived_at: str | None
     crawl_attempts: int
     archive_attempts: int
+    snapshot_ts: str | None
+    snapshot_url: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class Capture:
+    """What a Save Page Now job reported about its capture: the snapshot time and URL."""
+
+    timestamp: str | None = None
+    original_url: str | None = None
 
 
 class Catalog:
@@ -115,11 +133,9 @@ class Catalog:
             self._conn.execute("PRAGMA synchronous=NORMAL;")  # safe in WAL mode, far fewer syncs
             self._conn.execute(_CREATE_TABLE_SQL)
             existing = {row[1] for row in self._conn.execute("PRAGMA table_info(urls)")}
-            for column in _ATTEMPT_COLUMNS:
+            for column, definition in _ADDED_COLUMNS.items():
                 if column not in existing:
-                    self._conn.execute(
-                        f"ALTER TABLE urls ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-                    )
+                    self._conn.execute(f"ALTER TABLE urls ADD COLUMN {column} {definition}")
             for statement in _CREATE_INDEXES_SQL:
                 self._conn.execute(statement)
 
@@ -229,13 +245,22 @@ class Catalog:
         archive_status: ArchiveState,
         http_status: int | None,
         now: datetime | None = None,
+        capture: Capture | None = None,
     ) -> None:
-        """Persist Wayback availability or submission outcome."""
+        """Persist the Wayback outcome. A job's snapshot time and URL go with it, or clear."""
+        found = capture or Capture()
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE urls SET archive_status = ?, archive_http_status = ?, archived_at = ? "
-                "WHERE url = ?",
-                (archive_status, http_status, self._stamp(now), url),
+                "UPDATE urls SET archive_status = ?, archive_http_status = ?, archived_at = ?, "
+                "snapshot_ts = ?, snapshot_url = ? WHERE url = ?",
+                (
+                    archive_status,
+                    http_status,
+                    self._stamp(now),
+                    found.timestamp,
+                    found.original_url,
+                    url,
+                ),
             )
 
     def requeue_archive(self, url: str, max_attempts: int) -> bool:

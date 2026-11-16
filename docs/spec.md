@@ -59,13 +59,15 @@ CREATE TABLE IF NOT EXISTS urls (
     archive_http_status INTEGER,
     archived_at TEXT,
     crawl_attempts INTEGER NOT NULL DEFAULT 0,
-    archive_attempts INTEGER NOT NULL DEFAULT 0
+    archive_attempts INTEGER NOT NULL DEFAULT 0,
+    snapshot_ts TEXT,
+    snapshot_url TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_crawl ON urls (needs_crawl, crawl_attempts);
 CREATE INDEX IF NOT EXISTS idx_archive ON urls (archive_status, archive_attempts);
 ```
 
-Migration: when `PRAGMA table_info(urls)` lacks `crawl_attempts` or `archive_attempts`, the catalog adds the column with `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT 0`. Then it creates the indexes. Existing rows keep their data.
+Migration: when `PRAGMA table_info(urls)` lacks `crawl_attempts`, `archive_attempts`, `snapshot_ts`, or `snapshot_url`, the catalog adds the column with `ALTER TABLE ... ADD COLUMN`. The attempt columns are `NOT NULL DEFAULT 0`. The snapshot columns are nullable. Then it creates the indexes. Existing rows keep their data.
 
 Timestamps are ISO 8601 UTC strings with microseconds. They sort in time order as text.
 
@@ -119,14 +121,14 @@ Archive eligibility: `is_internal = 0` or (`needs_crawl = 0` and `crawl_status N
   - `extract_links(html_text, base_url, allowed_schemes) -> list[str]`
   - `read_sitemap_bytes(raw, cap) -> str | None`
   - `parse_sitemap(text) -> tuple[bool, list[str]]`
-- `catalog.py`: the constants `CRAWL_FAILED` (0) and `CRAWL_ROBOTS_BLOCKED` (-1), `CrawlState`, `ArchiveState`, `CatalogEntry`, and `Catalog` with `get_entry`, `seed_url`, `insert_discovered`, `claim_next_crawl`, `record_crawl_result`, `requeue_crawl`, `claim_next_archive`, `record_archive_result`, `requeue_archive`, `reset_stale_in_progress`, `pending_counts`, `archive_coverage(now=None) -> (covered, unconfirmed, eligible)`, `close`.
+- `catalog.py`: the constants `CRAWL_FAILED` (0) and `CRAWL_ROBOTS_BLOCKED` (-1), `CrawlState`, `ArchiveState`, `CatalogEntry`, and `Catalog` with `get_entry`, `seed_url`, `insert_discovered`, `claim_next_crawl`, `record_crawl_result`, `requeue_crawl`, `claim_next_archive`, `record_archive_result(url, status, http_status, now=None, capture=None)`, `requeue_archive`, `reset_stale_in_progress`, `pending_counts`, `archive_coverage(now=None) -> (covered, unconfirmed, eligible)`, `close`.
 - `fetcher.py`:
   - `Request(url, method="GET", headers, body, max_bytes=0, follow_redirects=True, escalate_on_403=True, pin_ips=())`. `max_bytes=0` means `settings.max_body_bytes`.
   - `FetchResult(status_code, headers, body, content_type, final_url="", truncated=False)` with a `text` property.
   - `parse_retry_after(value, max_wait, now=None) -> float | None`
   - `fetch_with_curl(req, user_agent, timeout)`, `fetch_with_curl_cffi(req, user_agent, timeout, impersonate)`, `CamoufoxPool.fetch(req)`.
   - `TieredFetcher(settings, transports=None, sleep_fn=None, clock=time.monotonic)` with `fetch(request) -> FetchResult`, `interruptible_sleep(seconds)` (the default `sleep_fn`; raises `StopRequested` after a stop), and `request_stop()`.
-- `wayback.py`: `WaybackClient(fetcher, settings, credentials=None, sleep_fn=None, clock=time.monotonic)` (the default `sleep_fn` is the fetcher's `interruptible_sleep`) with `is_archived(url, now=None) -> tuple[bool, int]` and `submit_url(url) -> tuple[ArchiveState, int]`. `submit_url` waits for its pacing slot first.
+- `wayback.py`: `WaybackClient(fetcher, settings, credentials=None, sleep_fn=None, clock=time.monotonic)` (the default `sleep_fn` is the fetcher's `interruptible_sleep`) with `is_archived(url, now=None) -> tuple[bool, int]` and `submit_url(url) -> Submission` (a named tuple of `state`, `status`, and `capture`). `submit_url` waits for its pacing slot first.
 - `runner.py`: `CrawlSummary` (`crawled`, `robots_blocked`, `crawl_failed`, `archived`, `submitted`, `archive_skipped`, `archive_failed`, `covered`, `unconfirmed`, `eligible`, and the `coverage_percent` property), `RobotsGuard`, `catalog_path(db_path, seed_url) -> Path`, `run_archiver(start_url, settings, console=None, fetcher=None, sleep_fn=None) -> CrawlSummary`.
 - `main.py`: Typer CLI. `start_url` is the argument. `--config` defaults to `config.yml`. Exit code `0` on completion, `1` on a `CivilServiceError` (the message goes to standard error as plain text), and `130` on Ctrl-C.
 
@@ -215,7 +217,7 @@ Source: the SPN2 public API documentation, updated 2026-07-22.
 1. `POST {spn2_save_url}` with the form body `url=<url>` and these headers: `Accept: application/json`, `Content-Type: application/x-www-form-urlencoded`, `Authorization: LOW <access>:<secret>`.
 2. A non-2xx answer gives `FAILED`. A 2xx answer must hold a JSON `job_id`. Without it the result is `FAILED`.
 3. `GET {spn2_status_url}<job_id>` with the same `Accept` and `Authorization` headers, without redirects, up to `spn2_max_polls` times, with `spn2_poll_seconds` between polls (no wait after the last poll). The JSON field `status` is `pending`, `success`, or `error`. Any other value counts as `pending`. A transient error while polling stops the polling with `SUBMITTED`, because the job exists and the tool must not post it again.
-4. `success` gives `ARCHIVED`. `error` gives `FAILED`. Still `pending` after the last poll gives `SUBMITTED`.
+4. `success` gives `ARCHIVED` only when the payload has a non-empty `timestamp`. The result then carries a `Capture(timestamp, original_url)`, and the catalog stores both in `snapshot_ts` and `snapshot_url`. A `success` without `timestamp` gives `SUBMITTED`. `error` gives `FAILED`, unless `status_ext` (without the `error:` prefix) is one of the temporary codes: `user-session-limit`, `too-many-requests`, `service-unavailable`, `bad-gateway`, `gateway-timeout`, `read-timeout`, `browsing-timeout`, `soft-time-limit-exceeded`, `no-browsers-available`, `cannot-fetch`, `celery`, `job-failed`, `capture-location-error`, `internal-server-error`, `proxy-error`, `protocol-error`. A temporary code raises `TransientFetchError`, and the runner tries the URL again. Still `pending` after the last poll gives `SUBMITTED`. A 2xx answer to the POST without `job_id` is sorted the same way: a temporary `status_ext` raises, any other answer gives `FAILED`.
 
 The tool does not send `capture_outlinks`. It queues each outlink itself, so each page gets its own rate-limit slot and catalog row.
 
@@ -245,7 +247,7 @@ Not verified: the SPN2 documentation does not show the answer to a capture reque
 
 `configure_logging` sends `structlog` events as one JSON object per line (`orjson`) to standard error through the root `logging.StreamHandler`. The `rich` progress display uses the console (standard output).
 
-Events: `robots_disallowed`, `crawl_failed`, `crawl_retry`, `archive_failed`, `archive_retry`, `archive_skipped`, `body_capped`, `sitemap_unavailable`, `sitemap_rejected`. Events hold URLs and error text. They never hold header values.
+Events: `archive_job` (one for each Save Page Now job: `job_id`, `status`, `status_ext`, `message`, `timestamp`, `original_url`; never headers), `robots_disallowed`, `crawl_failed`, `crawl_retry`, `archive_failed`, `archive_retry`, `archive_skipped`, `body_capped`, `sitemap_unavailable`, `sitemap_rejected`. Events hold URLs and error text. They never hold header values.
 
 ## 9. Quality and Security Requirements
 
@@ -268,6 +270,6 @@ Events: `robots_disallowed`, `crawl_failed`, `crawl_retry`, `archive_failed`, `a
 | FR-8 | `test_catalog.py`: `test_failed_fetches_stay_eligible_and_only_gone_pages_skip_archiving`. `test_runner.py`: `test_runner_submits_unfetchable_pages_but_not_gone_pages` |
 | FR-9 | `test_wayback.py`: `test_default_freshness_window_is_seven_days`, `test_snapshot_age_and_error_cases`, `test_anonymous_client_checks_availability_with_timestamp_and_submits_by_get` |
 | FR-10 | `test_catalog.py`: `test_requeue_counts_attempts_and_orders_fresh_urls_first`. `test_runner.py`: `test_runner_retries_transient_crawl_and_archive_failures_inside_the_run`, `test_retries_do_not_use_up_the_page_and_archive_limits`, `test_hosts_that_do_not_resolve_retry_and_then_fail_and_are_never_skipped` |
-| FR-11 | `test_wayback.py`: `test_spn2_posts_with_authorization_and_polls_until_the_job_succeeds`, `test_spn2_job_outcomes`, `test_submissions_share_one_paced_rate_and_availability_checks_do_not_wait`, `test_spn2_transient_error_while_polling_keeps_the_job_and_never_posts_again`, `test_spn2_polling_stops_with_submitted_on_a_stop_request_or_an_unreadable_reply`. `test_runner.py`: `test_runner_uses_spn2_when_keys_are_set`, `test_runner_paces_only_submissions_with_the_archive_delay`, `test_api_keys_never_reach_logs`. `test_fetcher.py`: `test_curl_transport_sends_secrets_through_files_and_pins_the_address` |
+| FR-11 | `test_wayback.py`: `test_a_success_is_confirmed_only_when_the_job_reports_a_snapshot_time`, `test_every_temporary_job_error_raises_so_the_url_is_tried_again`, `test_final_job_errors_fail_the_url`, `test_a_post_answer_without_a_job_id_is_logged_and_sorted_like_a_job_error`, `test_job_events_are_logged_and_hold_no_headers_or_keys`. `test_runner.py`: `test_a_temporary_job_error_requeues_the_url_and_a_final_one_fails_it`. `test_catalog.py`: `test_a_job_capture_is_stored_with_the_result_and_cleared_by_the_next_one`. `test_wayback.py`: `test_spn2_posts_with_authorization_and_polls_until_the_job_succeeds`, `test_spn2_job_outcomes`, `test_submissions_share_one_paced_rate_and_availability_checks_do_not_wait`, `test_spn2_transient_error_while_polling_keeps_the_job_and_never_posts_again`, `test_spn2_polling_stops_with_submitted_on_a_stop_request_or_an_unreadable_reply`. `test_runner.py`: `test_runner_uses_spn2_when_keys_are_set`, `test_runner_paces_only_submissions_with_the_archive_delay`, `test_api_keys_never_reach_logs`. `test_fetcher.py`: `test_curl_transport_sends_secrets_through_files_and_pins_the_address` |
 | FR-12 | `test_urls.py`: `test_unicode_hosts_become_ascii_so_the_check_and_the_fetch_use_one_name`, `test_ip_literals_are_recognized`. `test_fetcher.py`: `test_curl_command_pins_names_but_not_ip_literals`, `test_curl_cffi_does_not_pin_ip_literals`, `test_camoufox_checks_the_redirect_chain_and_restarts_a_crashed_browser`. `test_runner.py`: `test_a_failure_at_the_wayback_endpoint_is_not_blamed_on_the_target_url`. `test_docs_hygiene.py` (public documents hold no internal notes, and the README follows the sentence, paragraph, phrase, and punctuation rules of `asd-ste.yaml`). `test_fetcher.py`: `test_curl_cffi_pins_a_list_of_addresses_and_falls_back_to_the_reachable_one`, `test_interruptible_sleep_waits_until_a_stop_request_ends_it`. `test_urls.py`: `test_validate_public_host_blocks_private_and_link_local_ips`, `test_host_port_uses_scheme_defaults_and_rejects_bad_input`. `test_fetcher.py`: `test_redirects_validate_targets_limit_hops_and_switch_method`, `test_redirect_edge_cases_and_post_method_rules`, `test_fetch_pins_validated_ip_and_applies_body_cap_default_and_override`, `test_curl_transport_caps_large_and_chunked_bodies_and_keeps_headers`, `test_read_capped_cuts_at_the_limit` |
 | Coverage measure | `test_catalog.py`: `test_archive_coverage_counts_fresh_snapshots`. `test_runner.py`: `test_crawl_summary_percent_handles_an_empty_catalog` |

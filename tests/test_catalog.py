@@ -3,7 +3,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from civil_service.catalog import CRAWL_FAILED, CRAWL_ROBOTS_BLOCKED, ArchiveState, Catalog
+from civil_service.catalog import (
+    CRAWL_FAILED,
+    CRAWL_ROBOTS_BLOCKED,
+    ArchiveState,
+    Capture,
+    Catalog,
+)
 
 NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
 PAGE = "https://example.com/"
@@ -189,6 +195,7 @@ def test_old_database_gains_attempt_columns_and_indexes(tmp_path: Path) -> None:
     entry = cat.get_entry(PAGE)
     assert entry is not None
     assert (entry.crawl_attempts, entry.archive_attempts) == (0, 0)
+    assert (entry.snapshot_ts, entry.snapshot_url) == (None, None)
     indexes = {row[1] for row in cat._conn.execute("PRAGMA index_list(urls)")}
     assert {"idx_crawl", "idx_archive"} <= indexes
     cat.close()
@@ -207,4 +214,22 @@ def test_catalog_concurrent_claims_never_duplicate(tmp_path: Path) -> None:
     claimed_archives = [u for u in archives if u is not None]
     assert len(claimed_crawls) == len(set(claimed_crawls)) == 10
     assert len(claimed_archives) == len(set(claimed_archives)) == 10
+    cat.close()
+
+
+def test_a_job_capture_is_stored_with_the_result_and_cleared_by_the_next_one(
+    tmp_path: Path,
+) -> None:
+    cat = Catalog(tmp_path / "capture.sqlite3", rearchive_window_days=7)
+    cat.insert_discovered("https://other.org/x", is_internal=False, now=NOW)
+    assert cat.claim_next_archive() == "https://other.org/x"
+    capture = Capture("20261116042144", "https://other.org/x")
+    cat.record_archive_result("https://other.org/x", ArchiveState.ARCHIVED, 200, NOW, capture)
+    entry = cat.get_entry("https://other.org/x")
+    assert entry is not None
+    assert (entry.snapshot_ts, entry.snapshot_url) == ("20261116042144", "https://other.org/x")
+    cat.record_archive_result("https://other.org/x", ArchiveState.SUBMITTED, 200, NOW)
+    entry = cat.get_entry("https://other.org/x")
+    assert entry is not None
+    assert (entry.snapshot_ts, entry.snapshot_url) == (None, None)
     cat.close()

@@ -5,17 +5,41 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote, urlencode
 
 import orjson
+import structlog
 
-from civil_service.catalog import ArchiveState
+from civil_service.catalog import ArchiveState, Capture
 from civil_service.config import AppSettings, SpnCredentials
 from civil_service.exceptions import ArchiveError, StopRequested, TransientFetchError
 from civil_service.fetcher import FetchResult, Request, TieredFetcher
 
+_LOGGER = structlog.get_logger(__name__)
 _WAYBACK_TS_FORMAT = "%Y%m%d%H%M%S"
+# status_ext values (without the "error:" prefix) that a later try can fix. Any other error is
+# final for this URL: the page is blocked, gone, or over its daily capture limit.
+_TRANSIENT_JOB_ERRORS = frozenset(
+    {
+        "user-session-limit",
+        "too-many-requests",
+        "service-unavailable",
+        "bad-gateway",
+        "gateway-timeout",
+        "read-timeout",
+        "browsing-timeout",
+        "soft-time-limit-exceeded",
+        "no-browsers-available",
+        "cannot-fetch",
+        "celery",
+        "job-failed",
+        "capture-location-error",
+        "internal-server-error",
+        "proxy-error",
+        "protocol-error",
+    }
+)
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _JSON_ACCEPT = "application/json"
 
@@ -35,6 +59,34 @@ def _is_fresh_snapshot(
     except ValueError:
         return False
     return (current_time - snapshot_dt) < timedelta(days=max_age_days)
+
+
+class Submission(NamedTuple):
+    """The result of one Save Page Now submission."""
+
+    state: ArchiveState
+    status: int
+    capture: Capture | None = None
+
+
+def _text(value: object) -> str | None:
+    """Return value when it is a non-empty string, else None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _raise_if_transient(payload: dict[str, Any], job_id: str | None) -> None:
+    """Log a failed job and raise TransientFetchError when its error is a temporary one."""
+    status_ext = _text(payload.get("status_ext"))
+    _LOGGER.warning(
+        "archive_job",
+        job_id=job_id,
+        status="error",
+        status_ext=status_ext,
+        message=_text(payload.get("message")),
+    )
+    if status_ext is not None and status_ext.removeprefix("error:") in _TRANSIENT_JOB_ERRORS:
+        msg = f"Save Page Now reported a temporary error: {status_ext}"
+        raise TransientFetchError(msg)
 
 
 def _parse_json(res: FetchResult, url: str) -> dict[str, Any]:
@@ -125,22 +177,24 @@ class WaybackClient:
         fresh = _is_fresh_snapshot(closest, self._settings.wayback_max_age_days, current_time)
         return fresh, res.status_code
 
-    def submit_url(self, url: str) -> tuple[ArchiveState, int]:
-        """Submit url to Save Page Now. Return the archive state and the HTTP status."""
+    def submit_url(self, url: str) -> Submission:
+        """Submit url to Save Page Now. Return the archive state, HTTP status, and capture."""
         self._wait_for_slot()
         if self._authorization is None:
             return self._submit_anonymous(url)
         return self._submit_spn2(url, self._authorization)
 
-    def _submit_anonymous(self, url: str) -> tuple[ArchiveState, int]:
+    def _submit_anonymous(self, url: str) -> Submission:
         save_endpoint = f"{self._settings.wayback_save_url.rstrip('/')}/{url}"
         res = self._fetcher.fetch(
             Request(save_endpoint, follow_redirects=False, escalate_on_403=False)
         )
         accepted = HTTPStatus.OK <= res.status_code < HTTPStatus.BAD_REQUEST
-        return (ArchiveState.SUBMITTED if accepted else ArchiveState.FAILED), res.status_code
+        return Submission(
+            ArchiveState.SUBMITTED if accepted else ArchiveState.FAILED, res.status_code
+        )
 
-    def _submit_spn2(self, url: str, authorization: str) -> tuple[ArchiveState, int]:
+    def _submit_spn2(self, url: str, authorization: str) -> Submission:
         headers = {"Accept": _JSON_ACCEPT, "Authorization": authorization}
         res = self._fetcher.fetch(
             Request(
@@ -153,16 +207,19 @@ class WaybackClient:
             )
         )
         if not (HTTPStatus.OK <= res.status_code < HTTPStatus.MULTIPLE_CHOICES):
-            return ArchiveState.FAILED, res.status_code
-        job_id = _parse_json(res, url).get("job_id")
-        if not isinstance(job_id, str):
-            return ArchiveState.FAILED, res.status_code
+            return Submission(ArchiveState.FAILED, res.status_code)
+        payload = _parse_json(res, url)
+        job_id = _text(payload.get("job_id"))
+        if job_id is None:
+            _raise_if_transient(payload, None)
+            return Submission(ArchiveState.FAILED, res.status_code)
         return self._poll_job(job_id, headers, res.status_code)
 
-    def _poll_job(
-        self, job_id: str, headers: dict[str, str], submit_status: int
-    ) -> tuple[ArchiveState, int]:
+    def _poll_job(self, job_id: str, headers: dict[str, str], submit_status: int) -> Submission:
         """Poll an SPN2 job. A job still pending after the last poll counts as SUBMITTED.
+
+        A success counts as ARCHIVED only when the job reports a snapshot time. A temporary
+        job error raises TransientFetchError, so the caller tries the URL again later.
 
         A transient failure, an unreadable reply, or a stop request while polling also gives
         SUBMITTED. The job exists, so the tool must not post it again.
@@ -177,11 +234,26 @@ class WaybackClient:
                         status_url, headers=headers, follow_redirects=False, escalate_on_403=False
                     )
                 )
-                state = _parse_json(res, status_url).get("status")
+                payload = _parse_json(res, status_url)
             except (TransientFetchError, StopRequested, ArchiveError):
                 break
+            state = payload.get("status")
             if state == "success":
-                return ArchiveState.ARCHIVED, res.status_code
+                capture = Capture(
+                    _text(payload.get("timestamp")), _text(payload.get("original_url"))
+                )
+                _LOGGER.info(
+                    "archive_job",
+                    job_id=job_id,
+                    status="success",
+                    timestamp=capture.timestamp,
+                    original_url=capture.original_url,
+                )
+                if capture.timestamp is None:  # no snapshot time: not proof of a capture
+                    return Submission(ArchiveState.SUBMITTED, res.status_code)
+                return Submission(ArchiveState.ARCHIVED, res.status_code, capture)
             if state == "error":
-                return ArchiveState.FAILED, res.status_code
-        return ArchiveState.SUBMITTED, submit_status
+                _raise_if_transient(payload, job_id)
+                return Submission(ArchiveState.FAILED, res.status_code)
+        _LOGGER.info("archive_job", job_id=job_id, status="pending")
+        return Submission(ArchiveState.SUBMITTED, submit_status)

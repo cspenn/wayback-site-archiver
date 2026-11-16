@@ -41,7 +41,7 @@ from civil_service.urls import (
     read_sitemap_bytes,
     validate_public_host,
 )
-from civil_service.wayback import WaybackClient
+from civil_service.wayback import Submission, WaybackClient
 
 _LOGGER = structlog.get_logger(__name__)
 _HTML_MIME = "text/html"
@@ -321,10 +321,10 @@ class _ArchiverRunner:
             self._summary.archive_failed += 1
         _LOGGER.warning("archive_failed", url=url, error=str(reason))
 
-    def _check_and_submit(self, url: str) -> tuple[ArchiveState, int]:
+    def _check_and_submit(self, url: str) -> Submission:
         archived, status = self._wayback.is_archived(url)
         if archived:
-            return ArchiveState.ARCHIVED, status
+            return Submission(ArchiveState.ARCHIVED, status)
         return self._wayback.submit_url(url)
 
     def _archive_one(self, url: str) -> bool:
@@ -338,7 +338,7 @@ class _ArchiverRunner:
                     self._summary.archive_skipped += 1
                 _LOGGER.info("archive_skipped", url=url, error=str(exc))
                 return False
-            state, status = self._check_and_submit(url)
+            submission = self._check_and_submit(url)
         except TransientFetchError as exc:
             if self._catalog.requeue_archive(url, self._settings.max_transient_attempts):
                 _LOGGER.info("archive_retry", url=url, error=str(exc))
@@ -351,10 +351,11 @@ class _ArchiverRunner:
             self._fail_archive(url, None, exc)
             return False
 
+        state, status, capture = submission
         if state is ArchiveState.FAILED:
             self._fail_archive(url, status, f"Save Page Now answered HTTP {status}")
             return False
-        self._catalog.record_archive_result(url, state, status)
+        self._catalog.record_archive_result(url, state, status, capture=capture)
         with self._cond:
             if state is ArchiveState.ARCHIVED:
                 self._summary.archived += 1

@@ -663,7 +663,10 @@ def spn2_web() -> FakeWeb:
                 200, {}, b'{"job_id":"j1"}', "application/json"
             ),
             "https://web.archive.org/save/status/j1": FetchResult(
-                200, {}, b'{"status":"success"}', "application/json"
+                200,
+                {},
+                b'{"status":"success","timestamp":"20261116042144","original_url":"x"}',
+                "application/json",
             ),
         }
     )
@@ -688,6 +691,7 @@ def test_runner_uses_spn2_when_keys_are_set(
     row = entry(settings, "https://example.com/two")
     assert row is not None
     assert row.archive_status == "ARCHIVED"
+    assert (row.snapshot_ts, row.snapshot_url) == ("20261116042144", "x")
 
 
 def test_api_keys_never_reach_logs(
@@ -940,3 +944,39 @@ def test_a_crash_between_saving_links_and_marking_the_page_done_loses_no_link(
     assert summary.crawl_failed == 0
     for name in "abc":
         assert entry(settings, f"https://example.com/{name}").crawl_status == 200
+
+
+def test_a_temporary_job_error_requeues_the_url_and_a_final_one_fails_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CIVIL_SERVICE_SPN_ACCESS_KEY", "access")
+    monkeypatch.setenv("CIVIL_SERVICE_SPN_SECRET_KEY", "s3cret")
+    replies = iter(
+        [
+            b'{"status":"error","status_ext":"error:user-session-limit"}',
+            b'{"status":"success","timestamp":"20261116042144"}',
+        ]
+    )
+
+    def status(_req: Request) -> FetchResult:
+        return FetchResult(200, {}, next(replies), "application/json")
+
+    web = spn2_web()
+    web.pages["https://example.com/"] = html("")
+    web.pages.pop("https://example.com/two")
+    web.pages["https://web.archive.org/save/status/j1"] = status
+    settings = settings_for(tmp_path, "temporary_job", spn2_delay_seconds=0.0)
+    summary = run(web, settings)
+    assert (summary.archived, summary.archive_failed) == (1, 0)
+    row = entry(settings, "https://example.com/")
+    assert (row.archive_status, row.archive_attempts) == ("ARCHIVED", 1)
+
+    final = spn2_web()
+    final.pages["https://example.com/"] = html("")
+    final.pages["https://web.archive.org/save/status/j1"] = FetchResult(
+        200, {}, b'{"status":"error","status_ext":"error:blocked-url"}', "application/json"
+    )
+    final_settings = settings_for(tmp_path, "final_job", spn2_delay_seconds=0.0)
+    final_summary = run(final, final_settings)
+    assert (final_summary.archived, final_summary.archive_failed) == (0, 1)
+    assert entry(final_settings, "https://example.com/").archive_status == "FAILED"

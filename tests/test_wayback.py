@@ -2,8 +2,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
+import structlog
 
-from civil_service.catalog import ArchiveState
+from civil_service.catalog import ArchiveState, Capture
 from civil_service.config import AppSettings, SpnCredentials
 from civil_service.exceptions import (
     ArchiveError,
@@ -12,10 +13,14 @@ from civil_service.exceptions import (
     TransientFetchError,
 )
 from civil_service.fetcher import FetchResult, Request, TieredFetcher
-from civil_service.wayback import WaybackClient
+from civil_service.wayback import _TRANSIENT_JOB_ERRORS, Submission, WaybackClient
 
 NOW = datetime(2026, 11, 15, 12, 0, 0, tzinfo=UTC)
 JSON = "application/json"
+
+
+def outcome(submission: Submission) -> tuple[ArchiveState, int]:
+    return submission.state, submission.status
 
 
 def json_result(body: bytes, status: int = 200) -> FetchResult:
@@ -57,7 +62,7 @@ def test_anonymous_client_checks_availability_with_timestamp_and_submits_by_get(
 
     client = build(transport)
     assert client.is_archived("https://example.com/page", now=NOW) == (False, 200)
-    assert client.submit_url("https://example.com/page") == (ArchiveState.SUBMITTED, 200)
+    assert outcome(client.submit_url("https://example.com/page")) == (ArchiveState.SUBMITTED, 200)
     avail, save = calls
     assert avail.url == (
         "https://archive.org/wayback/available?url=https%3A%2F%2Fexample.com%2Fpage"
@@ -108,7 +113,7 @@ def test_snapshot_age_and_error_cases() -> None:
     assert aged.is_archived("https://example.com/stale", now=NOW) == (False, 200)
     assert aged.is_archived("https://example.com/badts", now=NOW) == (False, 200)
     assert aged.is_archived("https://example.com/weird", now=NOW) == (False, 200)
-    assert aged.submit_url("https://example.com/bad") == (ArchiveState.FAILED, 400)
+    assert outcome(aged.submit_url("https://example.com/bad")) == (ArchiveState.FAILED, 400)
     for bad in ("badjson", "notdict", "http404"):
         with pytest.raises(ArchiveError):
             aged.is_archived(f"https://example.com/{bad}", now=NOW)
@@ -179,7 +184,7 @@ def test_spn2_posts_with_authorization_and_polls_until_the_job_succeeds(
 
     slept: list[float] = []
     client = build(transport, spn_credentials(monkeypatch), slept, spn2_poll_seconds=5.0)
-    assert client.submit_url("https://example.com/p") == (ArchiveState.ARCHIVED, 200)
+    assert outcome(client.submit_url("https://example.com/p")) == (ArchiveState.ARCHIVED, 200)
     post, poll1, poll2 = calls
     assert post.url == "https://web.archive.org/save"
     assert post.headers["Authorization"] == "LOW access:s3cret"
@@ -205,7 +210,7 @@ def test_spn2_job_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:
         return transport
 
     error = build(job_transport(b'{"status":"error","status_ext":"error:blocked"}'), creds)
-    assert error.submit_url("https://example.com/") == (ArchiveState.FAILED, 200)
+    assert outcome(error.submit_url("https://example.com/")) == (ArchiveState.FAILED, 200)
 
     slept: list[float] = []
     pending = build(
@@ -215,13 +220,13 @@ def test_spn2_job_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:
         spn2_max_polls=3,
         spn2_poll_seconds=2.0,
     )
-    assert pending.submit_url("https://example.com/") == (ArchiveState.SUBMITTED, 200)
+    assert outcome(pending.submit_url("https://example.com/")) == (ArchiveState.SUBMITTED, 200)
     assert slept == [2.0, 2.0]
 
     rejected = build(lambda _r: json_result(b'{"message":"bad"}', status=400), creds)
-    assert rejected.submit_url("https://example.com/") == (ArchiveState.FAILED, 400)
+    assert outcome(rejected.submit_url("https://example.com/")) == (ArchiveState.FAILED, 400)
     no_job = build(lambda _r: json_result(b'{"message":"recent capture"}'), creds)
-    assert no_job.submit_url("https://example.com/") == (ArchiveState.FAILED, 200)
+    assert outcome(no_job.submit_url("https://example.com/")) == (ArchiveState.FAILED, 200)
     garbled = build(lambda _r: json_result(b"<html>"), creds)
     with pytest.raises(ArchiveError):
         garbled.submit_url("https://example.com/")
@@ -239,7 +244,7 @@ def test_spn2_transient_error_while_polling_keeps_the_job_and_never_posts_again(
         raise TransientFetchError("reset")
 
     client = build(transport, spn_credentials(monkeypatch))
-    assert client.submit_url("https://example.com/") == (ArchiveState.SUBMITTED, 200)
+    assert outcome(client.submit_url("https://example.com/")) == (ArchiveState.SUBMITTED, 200)
     assert len(posts) == 1
 
 
@@ -277,7 +282,7 @@ def test_spn2_polling_stops_with_submitted_on_a_stop_request_or_an_unreadable_re
 
     creds = spn_credentials(monkeypatch)
     unreadable = build(transport, creds)
-    assert unreadable.submit_url("https://example.com/") == (ArchiveState.SUBMITTED, 200)
+    assert outcome(unreadable.submit_url("https://example.com/")) == (ArchiveState.SUBMITTED, 200)
     assert state["polls"] == 1
 
     def stop_during_wait(_seconds: float) -> None:
@@ -287,5 +292,100 @@ def test_spn2_polling_stops_with_submitted_on_a_stop_request_or_an_unreadable_re
     config = AppSettings(fallbacks=["curl"], spn2_delay_seconds=0.0)
     fetcher = TieredFetcher(config, transports={"curl": transport})
     stopped = WaybackClient(fetcher, config, creds, sleep_fn=stop_during_wait)
-    assert stopped.submit_url("https://example.com/") == (ArchiveState.SUBMITTED, 200)
+    assert outcome(stopped.submit_url("https://example.com/")) == (ArchiveState.SUBMITTED, 200)
     assert len(posts) == 2  # one post for each submission, never a repeat for a known job
+
+
+JOB_OK = b'{"status":"success","timestamp":"20261116042144","original_url":"https://example.com/p"}'
+
+
+def job_web(job_reply: bytes, post_reply: bytes = b'{"job_id":"abc"}') -> object:
+    def transport(req: Request) -> FetchResult:
+        return json_result(post_reply if req.method == "POST" else job_reply)
+
+    return transport
+
+
+def test_a_success_is_confirmed_only_when_the_job_reports_a_snapshot_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    creds = spn_credentials(monkeypatch)
+    confirmed = build(job_web(JOB_OK), creds).submit_url("https://example.com/p")
+    assert confirmed.state is ArchiveState.ARCHIVED
+    assert confirmed.capture == Capture("20261116042144", "https://example.com/p")
+    for no_time in (
+        b'{"status":"success"}',
+        b'{"status":"success","timestamp":""}',
+        b'{"status":"success","timestamp":null}',
+        b'{"status":"success","timestamp":7}',
+    ):
+        unconfirmed = build(job_web(no_time), creds).submit_url("https://example.com/p")
+        assert (unconfirmed.state, unconfirmed.capture) == (ArchiveState.SUBMITTED, None)
+
+
+@pytest.mark.parametrize("ext", sorted(_TRANSIENT_JOB_ERRORS))
+def test_every_temporary_job_error_raises_so_the_url_is_tried_again(
+    monkeypatch: pytest.MonkeyPatch, ext: str
+) -> None:
+    reply = b'{"status":"error","status_ext":"error:%s","message":"try later"}' % ext.encode()
+    client = build(job_web(reply), spn_credentials(monkeypatch))
+    with pytest.raises(TransientFetchError, match=ext):
+        client.submit_url("https://example.com/p")
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        b'{"status":"error","status_ext":"error:blocked-url"}',
+        b'{"status":"error","status_ext":"error:not-found"}',
+        b'{"status":"error","status_ext":"error:too-many-daily-captures"}',
+        b'{"status":"error"}',
+        b'{"status":"error","status_ext":""}',
+    ],
+)
+def test_final_job_errors_fail_the_url(monkeypatch: pytest.MonkeyPatch, reply: bytes) -> None:
+    client = build(job_web(reply), spn_credentials(monkeypatch))
+    assert outcome(client.submit_url("https://example.com/p")) == (ArchiveState.FAILED, 200)
+
+
+def test_a_post_answer_without_a_job_id_is_logged_and_sorted_like_a_job_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    creds = spn_credentials(monkeypatch)
+    busy = job_web(
+        b"{}", b'{"message":"All sessions busy","status_ext":"error:user-session-limit"}'
+    )
+    with structlog.testing.capture_logs() as logs, pytest.raises(TransientFetchError):
+        build(busy, creds).submit_url("https://example.com/p")
+    final = job_web(b"{}", b'{"message":"A newer capture exists"}')
+    with structlog.testing.capture_logs() as more:
+        assert outcome(build(final, creds).submit_url("https://example.com/p")) == (
+            ArchiveState.FAILED,
+            200,
+        )
+    assert logs[0]["message"] == "All sessions busy"
+    assert more[0]["message"] == "A newer capture exists"
+
+
+def test_job_events_are_logged_and_hold_no_headers_or_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    creds = spn_credentials(monkeypatch)
+    with structlog.testing.capture_logs() as logs:
+        build(job_web(JOB_OK), creds).submit_url("https://example.com/p")
+        build(job_web(b'{"status":"error","status_ext":"error:blocked-url"}'), creds).submit_url(
+            "https://example.com/p"
+        )
+        build(job_web(b'{"status":"pending"}'), creds, spn2_max_polls=1).submit_url(
+            "https://example.com/p"
+        )
+    assert [(e["event"], e["status"]) for e in logs] == [
+        ("archive_job", "success"),
+        ("archive_job", "error"),
+        ("archive_job", "pending"),
+    ]
+    assert logs[0]["timestamp"] == "20261116042144"
+    assert logs[1]["status_ext"] == "error:blocked-url"
+    text = str(logs)
+    assert "s3cret" not in text
+    assert "Authorization" not in text
